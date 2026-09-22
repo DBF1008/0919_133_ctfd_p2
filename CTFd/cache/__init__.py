@@ -1,5 +1,7 @@
-from functools import lru_cache, wraps
+from collections import OrderedDict, namedtuple
+from functools import _make_key, wraps
 from hashlib import md5
+from threading import RLock
 from time import monotonic_ns
 
 from flask import current_app, request
@@ -45,32 +47,74 @@ class CTFdCache(Cache):
 cache = CTFdCache()
 
 
+_TimedCacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+
+
 def timed_lru_cache(timeout: int = 300, maxsize: int = 64, typed: bool = False):
     """
     lru_cache implementation that includes a time based expiry
 
     Parameters:
-    seconds (int): Timeout in seconds to clear the WHOLE cache, default = 5 minutes
+    timeout (int): Timeout in seconds before an individual entry expires, default = 5 minutes
     maxsize (int): Maximum Size of the Cache
     typed (bool): Same value of different type will be a different entry
 
-    Implmentation from https://gist.github.com/Morreski/c1d08a3afa4040815eafd3891e16b945?permalink_comment_id=3437689#gistcomment-3437689
+    Entries expire and are evicted individually instead of clearing the
+    WHOLE cache at once. This avoids the recomputation stampede that a
+    full-cache clear causes when requests arrive right after an expiry.
     """
 
     def wrapper_cache(func):
-        func = lru_cache(maxsize=maxsize, typed=typed)(func)
-        func.delta = timeout * 10**9
-        func.expiration = monotonic_ns() + func.delta
+        ttl_ns = timeout * 10**9
+        store = OrderedDict()  # key -> (expiration_ns, value), LRU ordered
+        lock = RLock()
+        stats = [0, 0]  # hits, misses
 
         @wraps(func)
         def wrapped_func(*args, **kwargs):
-            if monotonic_ns() >= func.expiration:
-                func.cache_clear()
-                func.expiration = monotonic_ns() + func.delta
-            return func(*args, **kwargs)
+            key = _make_key(args, kwargs, typed)
+            now = monotonic_ns()
+            with lock:
+                entry = store.pop(key, None)
+                if entry is not None:
+                    expiration, value = entry
+                    if now < expiration:
+                        # Still fresh: refresh LRU position and serve it
+                        store[key] = entry
+                        stats[0] += 1
+                        return value
+                # Missing or expired: only this entry is evicted, the rest
+                # of the cache is left untouched
+                stats[1] += 1
 
-        wrapped_func.cache_info = func.cache_info
-        wrapped_func.cache_clear = func.cache_clear
+            # Compute outside of the lock so that concurrent calls for
+            # other keys (and reentrant calls) are not blocked
+            value = func(*args, **kwargs)
+
+            with lock:
+                if maxsize is None or maxsize > 0:
+                    # Evict expired entries first so that fresh entries are
+                    # not pushed out by stale ones
+                    expired = [k for k, (exp, _) in store.items() if exp <= now]
+                    for k in expired:
+                        del store[k]
+                    if maxsize is not None:
+                        while len(store) >= maxsize:
+                            store.popitem(last=False)
+                    store[key] = (now + ttl_ns, value)
+            return value
+
+        def cache_info():
+            with lock:
+                return _TimedCacheInfo(stats[0], stats[1], maxsize, len(store))
+
+        def cache_clear():
+            with lock:
+                store.clear()
+                stats[0] = stats[1] = 0
+
+        wrapped_func.cache_info = cache_info
+        wrapped_func.cache_clear = cache_clear
         return wrapped_func
 
     return wrapper_cache
@@ -176,6 +220,34 @@ def clear_standings():
 
     # Clear out scoreboard templates
     cache.delete(make_template_fragment_key(CacheKeys.PUBLIC_SCOREBOARD_TABLE))
+
+    # Re-warm the hottest standings caches so that the burst of requests
+    # that typically follows a cache clear doesn't stampede the database
+    # by recomputing standings concurrently (thundering herd)
+    _warm_standings_cache()
+
+
+def _warm_standings_cache():
+    """
+    Best-effort recomputation of the most frequently accessed standings
+    caches right after they are cleared.
+
+    Failures here must never break the request that triggered the cache
+    clear, so any exception is swallowed.
+    """
+    from CTFd.models import Teams
+    from CTFd.utils.modes import get_model
+    from CTFd.utils.scores import get_standings, get_user_standings
+
+    try:
+        # Used by the scoreboard page, ScoreboardList and ScoreboardDetail
+        get_standings()
+        if get_model() is Teams:
+            # ScoreboardList additionally uses user standings to display
+            # member scores when CTFd is running in teams mode
+            get_user_standings()
+    except Exception:  # nosec B110
+        pass
 
 
 def clear_challenges():

@@ -15,6 +15,28 @@ text_type = str
 binary_type = bytes
 
 
+class _ConfigCacheMiss:
+    """
+    Singleton sentinel used to cache the fact that a config key does not exist.
+
+    Flask-Caching is unable to roundtrip a value of None so a sentinel is
+    cached instead. A dedicated singleton is used rather than the KeyError
+    class so that identity checks behave consistently across Python runtimes
+    and so the sentinel can never be mistaken for a real config value.
+    It pickles by reference so identity is preserved across cache
+    serialization roundtrips (e.g. redis or SimpleCache).
+    """
+
+    def __reduce__(self):
+        return "_CONFIG_CACHE_MISS"
+
+    def __repr__(self):
+        return "<CONFIG_CACHE_MISS>"
+
+
+_CONFIG_CACHE_MISS = _ConfigCacheMiss()
+
+
 def markdown(md):
     return cmarkgfm.markdown_to_html_with_extensions(
         md,
@@ -58,8 +80,8 @@ def _get_config(key):
             else:
                 return value
     # Flask-Caching is unable to roundtrip a value of None.
-    # Return an exception so that we can still cache and avoid the db hit
-    return KeyError
+    # Return a singleton sentinel so that we can still cache and avoid the db hit
+    return _CONFIG_CACHE_MISS
 
 
 def get_config(key, default=None):
@@ -73,7 +95,7 @@ def get_config(key, default=None):
         key = str(key)
 
     value = _get_config(key)
-    if value is KeyError:
+    if value is _CONFIG_CACHE_MISS:
         # These defaults are used in situations where setup was skipped or partially completed
         if default is None and key in DEFAULTS:
             return DEFAULTS.get(key)
