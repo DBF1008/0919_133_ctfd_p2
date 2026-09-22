@@ -15,6 +15,20 @@ text_type = str
 binary_type = bytes
 
 
+class _ConfigNotFound:
+    """
+    Dedicated sentinel type representing a missing config value in the cache.
+
+    Flask-Caching is unable to roundtrip a value of None, so a sentinel is
+    cached instead to avoid repeated database hits for missing keys. A
+    dedicated class is used (rather than a builtin like KeyError) so the
+    sentinel can never be confused with a real exception or a legitimate
+    config value. The class object itself is cached because classes pickle
+    by reference, which preserves identity across cache backends (e.g.
+    redis) and keeps `is` comparisons reliable.
+    """
+
+
 def markdown(md):
     return cmarkgfm.markdown_to_html_with_extensions(
         md,
@@ -58,8 +72,8 @@ def _get_config(key):
             else:
                 return value
     # Flask-Caching is unable to roundtrip a value of None.
-    # Return an exception so that we can still cache and avoid the db hit
-    return KeyError
+    # Return a dedicated sentinel so that we can still cache and avoid the db hit
+    return _ConfigNotFound
 
 
 def get_config(key, default=None):
@@ -73,7 +87,7 @@ def get_config(key, default=None):
         key = str(key)
 
     value = _get_config(key)
-    if value is KeyError:
+    if value is _ConfigNotFound:
         # These defaults are used in situations where setup was skipped or partially completed
         if default is None and key in DEFAULTS:
             return DEFAULTS.get(key)

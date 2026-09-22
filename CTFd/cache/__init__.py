@@ -1,5 +1,7 @@
-from functools import lru_cache, wraps
+from collections import OrderedDict, namedtuple
+from functools import wraps
 from hashlib import md5
+from threading import RLock
 from time import monotonic_ns
 
 from flask import current_app, request
@@ -45,32 +47,81 @@ class CTFdCache(Cache):
 cache = CTFdCache()
 
 
+_TimedCacheInfo = namedtuple("CacheInfo", ["hits", "misses", "maxsize", "currsize"])
+
+# Marker used to separate positional and keyword arguments in cache keys
+_KWD_MARK = object()
+
+
 def timed_lru_cache(timeout: int = 300, maxsize: int = 64, typed: bool = False):
     """
     lru_cache implementation that includes a time based expiry
 
+    Entries expire individually once their age exceeds the timeout
+    (gradual eviction). This avoids the cache-stampede/performance spike
+    caused by clearing the entire cache at a single expiration instant.
+
     Parameters:
-    seconds (int): Timeout in seconds to clear the WHOLE cache, default = 5 minutes
+    timeout (int): Per-entry time to live in seconds, default = 5 minutes
     maxsize (int): Maximum Size of the Cache
     typed (bool): Same value of different type will be a different entry
-
-    Implmentation from https://gist.github.com/Morreski/c1d08a3afa4040815eafd3891e16b945?permalink_comment_id=3437689#gistcomment-3437689
     """
 
     def wrapper_cache(func):
-        func = lru_cache(maxsize=maxsize, typed=typed)(func)
-        func.delta = timeout * 10**9
-        func.expiration = monotonic_ns() + func.delta
+        lock = RLock()
+        # key -> (expiration_ns, value), ordered from least to most recently used
+        entries = OrderedDict()
+        stats = {"hits": 0, "misses": 0}
+        delta = timeout * 10**9
+
+        def make_key(args, kwargs):
+            key = args
+            if kwargs:
+                key += (_KWD_MARK,) + tuple(sorted(kwargs.items()))
+            if typed:
+                key += tuple(type(v) for v in args)
+                if kwargs:
+                    key += tuple(type(v) for _, v in sorted(kwargs.items()))
+            return key
 
         @wraps(func)
         def wrapped_func(*args, **kwargs):
-            if monotonic_ns() >= func.expiration:
-                func.cache_clear()
-                func.expiration = monotonic_ns() + func.delta
-            return func(*args, **kwargs)
+            key = make_key(args, kwargs)
+            now = monotonic_ns()
+            # The lock is held while computing so that concurrent callers for
+            # the same key cannot trigger a dogpile of duplicate computations
+            with lock:
+                entry = entries.pop(key, None)
+                if entry is not None:
+                    expiration, value = entry
+                    if now < expiration:
+                        entries[key] = entry
+                        stats["hits"] += 1
+                        return value
+                    # Expired entries are evicted individually (gradual expiry)
+                    stats["misses"] += 1
+                else:
+                    stats["misses"] += 1
+                value = func(*args, **kwargs)
+                entries[key] = (now + delta, value)
+                while len(entries) > maxsize:
+                    entries.popitem(last=False)
+                return value
 
-        wrapped_func.cache_info = func.cache_info
-        wrapped_func.cache_clear = func.cache_clear
+        def cache_clear():
+            with lock:
+                entries.clear()
+                stats["hits"] = 0
+                stats["misses"] = 0
+
+        def cache_info():
+            with lock:
+                return _TimedCacheInfo(
+                    stats["hits"], stats["misses"], maxsize, len(entries)
+                )
+
+        wrapped_func.cache_info = cache_info
+        wrapped_func.cache_clear = cache_clear
         return wrapped_func
 
     return wrapper_cache
@@ -130,7 +181,7 @@ def clear_config():
     cache.delete_memoized(get_app_config)
 
 
-def clear_standings():
+def clear_standings(warm=True):
     from CTFd.api import api
     from CTFd.api.v1.scoreboard import ScoreboardDetail, ScoreboardList
     from CTFd.constants.static import CacheKeys
@@ -176,6 +227,33 @@ def clear_standings():
 
     # Clear out scoreboard templates
     cache.delete(make_template_fragment_key(CacheKeys.PUBLIC_SCOREBOARD_TABLE))
+
+    if warm:
+        warm_standings()
+
+
+def warm_standings():
+    """
+    Recompute the hot, globally-shared standings caches immediately after
+    invalidation. Without warming, a burst of concurrent requests would all
+    find an empty cache and stampede the database with identical expensive
+    score queries (thundering herd). Warming collapses that burst into a
+    single recomputation.
+    """
+    from CTFd.utils import get_config
+    from CTFd.utils.modes import TEAMS_MODE
+    from CTFd.utils.scores import (
+        get_standings,
+        get_team_standings,
+        get_user_standings,
+    )
+
+    # Warm the default public standings used by the scoreboard page and API
+    get_standings()
+    if get_config("user_mode") == TEAMS_MODE:
+        get_team_standings()
+    else:
+        get_user_standings()
 
 
 def clear_challenges():

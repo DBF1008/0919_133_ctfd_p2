@@ -10,7 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy import inspect as SQLAInspect
 from sqlalchemy import pool
 
-from CTFd.utils import _get_config, set_config
+from CTFd.utils import _ConfigNotFound, _get_config, set_config
 
 
 def get_all_tables(op):
@@ -44,7 +44,7 @@ def current(plugin_name=None):
 
     # Specifically bypass the cached config so that we always get the database value
     version = _get_config.__wrapped__(plugin_name + "_alembic_version")
-    if version == KeyError:
+    if version is _ConfigNotFound:
         version = None
     return version
 
